@@ -1,0 +1,80 @@
+name: Build Orod APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        run: |
+          flutter create --org com.orod --project-name sare3 --platforms android .
+          rm -rf test
+          python3 tool/patch_android.py
+
+      - name: Download fonts
+        run: bash tool/fonts.sh
+
+      - name: Get packages
+        run: flutter pub get
+
+      - name: App icon
+        run: dart run flutter_launcher_icons
+
+      - name: Analyze
+        run: |
+          set +e
+          flutter analyze --no-fatal-infos --no-fatal-warnings > analyze.log 2>&1
+          code=$?
+          grep -E "error •|warning •" analyze.log | head -80
+          exit $code
+
+      - name: Build APK
+        run: |
+          flutter build apk --release
+          cp build/app/outputs/flutter-apk/app-release.apk OrodSare3.apk
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: OrodSare3-apk
+          path: '*.apk'
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: أورد على السريع ${{ github.run_number }}
+          files: |
+            OrodSare3.apk
+            analyze.log
+          make_latest: true
+
+      - name: Publish error log
+        if: failure()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: log-${{ github.run_number }}
+          name: build log ${{ github.run_number }}
+          prerelease: true
+          make_latest: false
+          files: |
+            analyze.log

@@ -1,0 +1,112 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function isAdmin() { return signedIn() && request.auth.token.email == 'rafatsaeed719@gmail.com'; }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function active() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)) && me().get('disabled', false) != true; }
+    function isOwner() { return active() && me().get('role', '') == 'owner'; }
+    function isCaptain() { return active() && me().get('role', '') == 'captain'; }
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+    function nw() { return request.resource.data; }
+    function old() { return resource.data; }
+
+    // بيانات خاصة: الرقم، كلمة السر، صور البطاقة
+    match /users/{u} {
+      allow read: if isAdmin() || (signedIn() && request.auth.uid == u);
+      allow create: if isAdmin() || (signedIn() && request.auth.uid == u
+        && nw().role in ['owner', 'captain'] && nw().phone is string
+        && request.auth.token.email == nw().phone + '@orod-sare3.app'
+        && nw().get('disabled', false) == false && !('createdByAdmin' in nw()));
+      allow update: if isAdmin() || (signedIn() && request.auth.uid == u
+        && !changed().hasAny(['role', 'phone', 'disabled', 'password', 'createdByAdmin']));
+      allow delete: if isAdmin();
+    }
+
+    // بروفايل الكابتن (بيشوفه أصحاب المشاريع)
+    match /captains/{u} {
+      allow read: if signedIn();
+      allow create: if isAdmin() || (signedIn() && request.auth.uid == u
+        && nw().verified == false && nw().blocked == false && nw().points == 0
+        && nw().trips == 0 && nw().ratingSum == 0 && nw().ratingCount == 0);
+      allow update: if isAdmin()
+        || (isCaptain() && request.auth.uid == u && old().get('blocked', false) != true
+            && changed().hasOnly(['name', 'photo', 'vehicle', 'online', 'lat', 'lng', 'locAt', 'idSent']))
+        || (signedIn() && request.auth.uid == u && changed().hasOnly(['online']) && nw().online == false)
+        || (isCaptain() && request.auth.uid == u && changed().hasOnly(['trips', 'points'])
+            && nw().trips == old().trips + 1 && nw().points == old().points + 10)
+        || (isCaptain() && request.auth.uid == u && changed().hasOnly(['points'])
+            && nw().points < old().points && nw().points >= 0)
+        || (isOwner() && changed().hasOnly(['ratingSum', 'ratingCount', 'points'])
+            && nw().ratingCount == old().ratingCount + 1
+            && nw().ratingSum - old().ratingSum >= 1 && nw().ratingSum - old().ratingSum <= 5
+            && nw().get('points', 0) - old().get('points', 0) in [0, 15]);
+      allow delete: if isAdmin();
+    }
+
+    // بروفايل المشروع
+    match /projects/{u} {
+      allow read: if signedIn();
+      allow create: if isAdmin() || (signedIn() && request.auth.uid == u && nw().blocked == false);
+      allow update: if isAdmin() || (isOwner() && request.auth.uid == u && !changed().hasAny(['blocked', 'phone']));
+      allow delete: if isAdmin();
+    }
+
+    match /orders/{id} {
+      allow read: if isAdmin() || (signedIn() && (resource.data.ownerUid == request.auth.uid || resource.data.captainUid == request.auth.uid));
+      allow create: if isOwner() && nw().ownerUid == request.auth.uid && nw().status == 'pending'
+        && nw().fee is number && nw().fee > 0 && nw().commPaid == 'no' && nw().rating == 0;
+      allow update: if isAdmin()
+        // صاحب المشروع: يلغي أو يبعت لكابتن تاني
+        || (isOwner() && old().ownerUid == request.auth.uid && old().status in ['pending', 'rejected']
+            && nw().status in ['pending', 'cancelled']
+            && changed().hasOnly(['status', 'captainUid', 'captainName', 'captainPhone', 'updatedAt']))
+        // صاحب المشروع: التقييم بعد التسليم
+        || (isOwner() && old().ownerUid == request.auth.uid && old().status == 'delivered' && old().rating == 0
+            && changed().hasOnly(['rating', 'ratingNote', 'updatedAt']) && nw().rating >= 1 && nw().rating <= 5)
+        // الكابتن: مراحل التوصيل
+        || (isCaptain() && old().captainUid == request.auth.uid
+            && old().status in ['pending', 'accepted', 'picked', 'onway', 'arrived']
+            && nw().status in ['accepted', 'rejected', 'picked', 'onway', 'arrived']
+            && changed().hasOnly(['status', 'updatedAt']))
+        // الكابتن: التسليم بالكود السري بس
+        || (isCaptain() && old().captainUid == request.auth.uid && old().status == 'arrived'
+            && nw().status == 'delivered' && changed().hasOnly(['status', 'otpIn', 'deliveredAt', 'updatedAt'])
+            && nw().otpIn == get(/databases/$(database)/documents/orders/$(id)/secret/otp).data.code)
+        // الكابتن: بلّغ إنه حوّل العمولة
+        || (isCaptain() && old().captainUid == request.auth.uid && old().status == 'delivered'
+            && old().commPaid == 'no' && changed().hasOnly(['commPaid']) && nw().commPaid == 'pending');
+      allow delete: if isAdmin();
+
+      // كود التسليم: صاحب المشروع والمدير بس
+      match /secret/{s} {
+        allow read: if isAdmin() || (signedIn() && get(/databases/$(database)/documents/orders/$(id)).data.ownerUid == request.auth.uid);
+        allow create: if isOwner() && getAfter(/databases/$(database)/documents/orders/$(id)).data.ownerUid == request.auth.uid;
+        allow update, delete: if isAdmin();
+      }
+    }
+
+    match /payments/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.captainUid == request.auth.uid);
+      allow create: if isCaptain() && nw().captainUid == request.auth.uid && nw().status == 'pending';
+      allow update, delete: if isAdmin();
+    }
+    match /redeems/{id} {
+      allow read: if isAdmin() || (signedIn() && resource.data.captainUid == request.auth.uid);
+      allow create: if isCaptain() && nw().captainUid == request.auth.uid && nw().status == 'pending';
+      allow update, delete: if isAdmin();
+    }
+    match /sos/{id} {
+      allow read, update, delete: if isAdmin();
+      allow create: if active() && nw().captainUid == request.auth.uid;
+    }
+    match /messages/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+    match /meta/{id} {
+      allow read: if signedIn();
+      allow write: if isAdmin();
+    }
+  }
+}
